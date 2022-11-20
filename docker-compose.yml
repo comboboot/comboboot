@@ -1,0 +1,12 @@
+version: "3"
+
+services:
+  comboserver:
+    build: .
+    ports:
+     - "9999:9999"
+     - "69:69/udp"
+    restart: unless-stopped
+    volumes:
+     - /mnt/nfsroot/pxe_configs/:/opt/comboboot/configs
+     - ../alis/:/opt/comboboot/static/alis
