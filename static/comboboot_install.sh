@@ -33,10 +33,15 @@ initrd http://{WEBSESSION}/amd-ucode.img
 initrd http://{WEBSESSION}/initramfs-linux.img
 EOF
 
-  tar -cv --one-file-system --zstd -f - -C /alisdir . | curl --progress-bar --verbose -XPOST -T - http://192.168.1.26:9999/${UUID}/upload
+  rm -rf /tmp/fifo
+  mkfifo /tmp/fifo
+  tar -cv --one-file-system --zstd -f - -C /alisdir . >/tmp/fifo &
+  pid=$!
 
   FILES="$FILES -F cfg=@/tmp/cfg"
+  FILES="$FILES -F rootfs.tar.zst=@/tmp/fifo"
   curl --progress-bar --verbose $FILES http://192.168.1.26:9999/${UUID}/upload
+  wait $pid
 
 }
 

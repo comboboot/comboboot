@@ -4,6 +4,7 @@ import asyncio
 import os
 import io
 import time
+import copy
 
 import struct
 import socket
@@ -11,58 +12,28 @@ import subprocess
 import socket
 from aiohttp import web
 
+from concurrent.futures import ThreadPoolExecutor
+
 COMBOSERVER_IP, COMBOSERVER_PORT = os.environ.get("COMBOSERVER", "127.0.0.1:9999").split(":")
-
-
 COMBODIR=(os.path.dirname(os.path.abspath(__file__)))
 
-IPXE_ITEMS=[("arch_install","arch install", """
+IPXE_ITEMS=[("arch_install","Archlinux installation", """
 kernel http://{WEBBASE}/iso/arch-install/arch/boot/x86_64/vmlinuz-linux archisobasedir=arch archiso_http_srv=http://{WEBBASE}/iso/arch-install/ ip=dhcp script=http://{WEBBASE}/static/comboboot_sfxgen.sh.cgi
 initrd http://{WEBBASE}/iso/arch-install/arch/boot/x86_64/initramfs-linux.img
 """)]
 
 class ClientSession:
-    def __init__(self, WEBIP, WEBPORT):
-        self.tftptransfers = {}
-        self.uuid = None
-        self.WEBIP = WEBIP
-        self.WEBPORT = WEBPORT
+    def __init__(self, uuid):
+        self.uuid = uuid
 
     def WEBSESSION(self):
-        return "%s:%s/%s/" % (self.WEBIP, self.WEBPORT, self.uuid)
+        return "%s:%s/%s/" % (COMBOSERVER_IP, COMBOSERVER_PORT, self.uuid)
 
     def WEBBASE(self):
-        return "%s:%s" % (self.WEBIP, self.WEBPORT)
+        return "%s:%s" % (COMBOSERVER_IP, COMBOSERVER_PORT)
 
-    def tftp_get_chunk(self, block_number, host_port, blksize=512):
-        f = self.tftptransfers[host_port]
-        if f.eof_custom_mark:
-            self.tftp_stop_file(host_port)
-            return bytes()
-        seek = (block_number-1)*blksize
-        if f.tell() != seek:
-            f.seek(seek)
-        data = f.read(blksize)
-        if len(data) != blksize:
-            f.eof_custom_mark = True
-        return data
-
-    def tftp_send_chunk(self, transport, block_number, host_port):
-        data_chunk = self.tftp_get_chunk(block_number, host_port)
-        CMD = 3
-        data_write = struct.pack("!hh", CMD, block_number) + data_chunk
-        transport.sendto(data_write, host_port)
-
-    def tftp_send_file(self, transport, f, host_port):
-        self.tftptransfers[host_port] = f
-        f.eof_custom_mark = False
-        self.tftp_send_chunk(transport, 1, host_port)
-
-    def tftp_stop_file(self, host_port):
-        del self.tftptransfers[host_port]
-
-    def get_cfg(self):
-        import copy
+    def gen_ipxe_cfg(self, request):
+        #TODO: cleanup pxe menu generation
         pxe_items = copy.deepcopy(IPXE_ITEMS)
         if os.path.exists(self.get_machine_dir()):
             for x in os.listdir((self.get_machine_dir())):
@@ -121,131 +92,132 @@ exit
         tail = request.match_info.get('tail', "")
         print(f"handle_http {self.uuid} {tail}", request.url)
         f = self.get_machine_dir() + "/" + tail
-        if self.uuid=="iso":
-            if tail.startswith("arch-install/"):
-                tail = tail.replace("arch-install/", "", 1)
-                isoPath = os.path.join(self.configsdir, "default", "archlinux-2022.11.01-x86_64.iso")
-                cmd = ["7z", "x", "-so", isoPath, tail]
-                #TODO: convert to stream...
-                output = subprocess.check_output(cmd)
-                print(" ".join(cmd), len(output))
-
-                resp = web.StreamResponse()
-                resp.content_type = "text/plain"
-                await resp.prepare(request)
-                await resp.write(output)
-                return resp
-
-        if self.uuid=="static":
-            f = os.path.join(COMBODIR, "static", tail)
-            if tail.endswith(".cgi"):
-                f = f.replace(".cgi", "")
-                f = subprocess.check_output([f], stderr=None)
-
-                resp = web.StreamResponse()
-                resp.content_type = "text/plain"
-                await resp.prepare(request)
-                await resp.write(f)
-                return resp
 
         if tail.endswith("cfg"):
             resp = web.StreamResponse()
             resp.content_type = "text/plain"
             await resp.prepare(request)
-            await resp.write(self.get_cfg().read())
+            await resp.write(self.gen_ipxe_cfg(request).read())
             return resp
 
         return web.FileResponse(f)
 
     async def handle_post(self, request):
-        # TODO: fix ugly way of detectig if we're sending tar stream
-        fpath = os.path.join(self.get_machine_dir(), "new")
-        fpath_target = os.path.join(self.get_machine_dir(), f"{int(time.time())}")
-        if "Content-Type" not in request.headers:
-            import shutil
-            os.makedirs(fpath, exist_ok=True)
-            from subprocess import Popen, PIPE, STDOUT
-            if os.path.exists(os.path.join(fpath, "rootfs.squashfs.new")):
-                os.unlink(os.path.join(fpath, "rootfs.squashfs.new"))
-            # -b 1048576 -comp zstd -Xcompression-level 22
-            p = Popen(["bash", "-c", "zstdcat - | sqfstar -b 1048576 -comp zstd  new/rootfs.squashfs.new"], stdout=None, stdin=PIPE, stderr=None, cwd=self.get_machine_dir())
-            while True:
-                chunk = await request.content.readany()
-                if not chunk:
-                    break
-                p.stdin.write(chunk)
-            p.stdin.close()
-            p.wait()
-            os.rename(os.path.join(fpath, "rootfs.squashfs.new"), os.path.join(fpath, "rootfs.squashfs"))
-            return web.Response()
+        from datetime import datetime
+        now = datetime.now()
+        cfg_name = now.strftime("%m%d%Y_%H%M")
+
+        machine_path = os.path.join(self.get_machine_dir(), f"{cfg_name}")
+        machine_path_tmp = machine_path+"_tmp"
+        os.makedirs(machine_path_tmp)
+
+
 
         reader = await request.multipart()
         while True:
             part = await reader.next()
             if part is None:
-                os.rename(fpath, fpath_target)
+                if os.path.exists(f"{machine_path_tmp}/rootfs.tar.zst"):
+                    repack_cmd = "zstdcat rootfs.tar.zst | sqfstar -force -b 1048576 -comp zstd rootfs.squashfs"
+                    subprocess.check_call(["bash", "-c", repack_cmd], cwd=machine_path_tmp)
+                os.rename(machine_path_tmp, machine_path)
                 break
-            fpath_tg = os.path.join(fpath, part.name)
-            print("writing", fpath_tg)
-            os.makedirs(os.path.dirname(fpath_tg), exist_ok=True)
-            f = open(fpath_tg, "wb")
-            while not part.at_eof():
-                filedata = await part.read_chunk()
-                f.write(filedata)
-        resp = web.Response()
+            print("writing", part.name)
+            with open(os.path.join(machine_path_tmp, part.name), "wb") as f:
+                while not part.at_eof():
+                    filedata = await part.read_chunk()
+                    f.write(filedata)
+
+        resp = web.StreamResponse()
+        resp.content_type = "text/plain"
+        await resp.prepare(request)
+        await resp.write(f"configuration {cfg_name} created\n".encode())
         return resp
 
     def get_machine_dir(self):
-        return self.configsdir + "/" + self.uuid
+        return os.path.join(COMBODIR, "configs", self.uuid)
 
-    def handle_ipxe_cfg(self, filename):
-        uuid = filename.strip("/").replace("arch/pxelinux.cfg/", "")
-        self.uuid = uuid
-
-        return self.get_cfg()
-
-
-class TftpPxe:
+class Comboserver:
     """ serves tftp connections from ipxe clients
     pxe requests via tftp also initiates the session
     """
 
-    current_clients = {}
+    def __init__(self):
+        pass
 
     async def handle(self, request):
         """ asyncio handler for http request """
         session = self.findSessionByRequest(request)
         return await session.handle_http(request)
 
+    async def handle_iso(self, request):
+        tail = request.match_info.get('tail', "")
+        if tail.startswith("arch-install/"):
+            tail = tail.replace("arch-install/", "", 1)
+            isoPath = os.path.join(COMBODIR, "configs", "default", "archlinux-2022.11.01-x86_64.iso")
+            cmd = ["7z", "x", "-so", isoPath, tail]
+            #TODO: convert to stream...
+            output = subprocess.check_output(cmd)
+            print(" ".join(cmd), len(output))
+
+            resp = web.StreamResponse()
+            resp.content_type = "text/plain"
+            await resp.prepare(request)
+            await resp.write(output)
+            return resp
+
+    async def handle_static(self, request):
+        tail = request.match_info.get('tail', "")
+        f = os.path.join(COMBODIR, "static", tail)
+        if tail.endswith(".cgi"):
+            f = f.replace(".cgi", "")
+            f = subprocess.check_output([f], stderr=None)
+
+            resp = web.StreamResponse()
+            resp.content_type = "text/plain"
+            await resp.prepare(request)
+            await resp.write(f)
+            return resp
+
     async def handle_post(self, request):
         session = self.findSessionByRequest(request)
         return await session.handle_post(request)
 
-    def startSession(self, host):
-        # TODO: add timeout for session
-        WEBPORT = self.WEBPORT
-        WEBIP = COMBOSERVER_IP
-        session = ClientSession(WEBIP, WEBPORT)
-        session.configsdir = os.path.join(COMBODIR, "configs")
-        self.current_clients[host] = session
-        return session
-
-    def stopSession(self, host):
-        del self.current_clients[host]
-
-    def findSessionByHost(self, host):
-        return self.current_clients[host]
-
     def findSessionByRequest(self, request):
         uuid = request.match_info.get('uuid')
-        for x in self.current_clients.values():
-            if x.uuid == uuid:
-                return x
+        return ClientSession(uuid)
 
-        remote = request.remote
-        session = self.startSession(remote)
-        session.uuid = uuid
-        return session
+class ComboserverTFTP:
+    def __init__(self):
+        # TODO: timeout transfers
+        self.tftptransfers = {}
+
+    def tftp_get_chunk(self, block_number, host_port, blksize=512):
+        f = self.tftptransfers[host_port]
+        if f.eof_custom_mark:
+            self.tftp_stop_file(host_port)
+            return bytes()
+        seek = (block_number-1)*blksize
+        if f.tell() != seek:
+            f.seek(seek)
+        data = f.read(blksize)
+        if len(data) != blksize:
+            f.eof_custom_mark = True
+        return data
+
+    def tftp_send_chunk(self, transport, block_number, host_port):
+        data_chunk = self.tftp_get_chunk(block_number, host_port)
+        CMD = 3
+        data_write = struct.pack("!hh", CMD, block_number) + data_chunk
+        transport.sendto(data_write, host_port)
+
+    def tftp_send_file(self, transport, f, host_port):
+        self.tftptransfers[host_port] = f
+        f.eof_custom_mark = False
+        self.tftp_send_chunk(transport, 1, host_port)
+
+    def tftp_stop_file(self, host_port):
+        del self.tftptransfers[host_port]
 
     def handle_RRQ(self, data, host_port):
         """ handle tfrp request """
@@ -260,12 +232,7 @@ class TftpPxe:
             # redirect default entry into pxe boot
             filename = os.path.join(COMBODIR, "comboboot.pxe")
             f = open(filename, 'rb')
-            session = self.startSession(host)
-            session.tftp_send_file(self.transport, f, host_port)
-        elif "arch/pxelinux.cfg" in filename:
-            session = self.startSession(host)
-            f = session.handle_ipxe_cfg(filename)
-            session.tftp_send_file(self.transport, f, host_port)
+            self.tftp_send_file(self.transport, f, host_port)
         else:
             print("unknown file ", filename)
 
@@ -279,36 +246,35 @@ class TftpPxe:
         tftpOpcode = struct.unpack("!h", data[:2])[0]
         host, port = host_port
 
-        sock = self.transport.get_extra_info('socket')
         if tftpOpcode == 1:
             self.handle_RRQ(data, host_port)
         elif tftpOpcode == 4:
             new_block = struct.unpack("!h", data[2:4])[0]
-            self.findSessionByHost(host).tftp_send_chunk(self.transport, new_block + 1, host_port)
+            self.tftp_send_chunk(self.transport, new_block + 1, host_port)
         elif tftpOpcode == 5:
             ERROR_str = data[2:].decode()
             # on error remove transfer
-            self.findSessionByHost(host).tftp_stop_file(host_port)
-
+            self.tftp_stop_file(host_port)
 
 async def main():
     loop = asyncio.get_running_loop()
     exit_future = asyncio.Future(loop=loop)
 
-    tftp_transport, tftp_protocol = await loop.create_datagram_endpoint(lambda: TftpPxe(), local_addr=('0.0.0.0', 69))
+    tftp_transport, tftp_protocol = await loop.create_datagram_endpoint(lambda: ComboserverTFTP(), local_addr=('0.0.0.0', 69))
+
+    comboserver = Comboserver()
 
     app = web.Application()
-    app.add_routes([web.get('/{uuid}/{tail:.*}', lambda request: tftp_protocol.handle(request))])
-    app.add_routes([web.post('/{uuid}/{tail:.*}', lambda request: tftp_protocol.handle_post(request))])
+    app.add_routes([web.get('/iso/{tail:.*}', lambda request: comboserver.handle_iso(request))])
+    app.add_routes([web.get('/static/{tail:.*}', lambda request: comboserver.handle_static(request))])
+    app.add_routes([web.get('/{uuid}/{tail:.*}', lambda request: comboserver.handle(request))])
+    app.add_routes([web.post('/{uuid}/{tail:.*}', lambda request: comboserver.handle_post(request))])
+    app["executor"] = ThreadPoolExecutor(max_workers=5)
 
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, port=COMBOSERVER_PORT)
     await site.start()
-
-    for x in site._server.sockets:
-        if x.family == socket.AddressFamily.AF_INET:
-            tftp_protocol.WEBPORT = x.getsockname()[1]
 
     try:
         await exit_future
