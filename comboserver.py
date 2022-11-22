@@ -5,6 +5,8 @@ import os
 import io
 import time
 import copy
+from pathlib import Path
+
 
 import struct
 import socket
@@ -17,10 +19,17 @@ from concurrent.futures import ThreadPoolExecutor
 COMBOSERVER_IP, COMBOSERVER_PORT = os.environ.get("COMBOSERVER", "127.0.0.1:9999").split(":")
 COMBODIR=(os.path.dirname(os.path.abspath(__file__)))
 
-IPXE_ITEMS=[("arch_install","Archlinux installation", """
+IPXE_ITEMS=[("arch_install","Archlinux installation comboinstall", """
 kernel http://{WEBBASE}/iso/arch-install/arch/boot/x86_64/vmlinuz-linux archisobasedir=arch archiso_http_srv=http://{WEBBASE}/iso/arch-install/ ip=dhcp script=http://{WEBBASE}/static/comboboot_sfxgen.sh.cgi
 initrd http://{WEBBASE}/iso/arch-install/arch/boot/x86_64/initramfs-linux.img
-""")]
+""")
+]
+
+IPXE_ITEMS+=[("arch_boot","Archlinux installation boot", """
+kernel http://{WEBBASE}/iso/arch-install/arch/boot/x86_64/vmlinuz-linux archisobasedir=arch archiso_http_srv=http://{WEBBASE}/iso/arch-install/ ip=dhcp
+initrd http://{WEBBASE}/iso/arch-install/arch/boot/x86_64/initramfs-linux.img
+""")
+]
 
 class ClientSession:
     def __init__(self, uuid):
@@ -35,8 +44,13 @@ class ClientSession:
     def gen_ipxe_cfg(self, request):
         #TODO: cleanup pxe menu generation
         pxe_items = copy.deepcopy(IPXE_ITEMS)
+
+
         if os.path.exists(self.get_machine_dir()):
-            for x in os.listdir((self.get_machine_dir())):
+            paths = sorted(Path(self.get_machine_dir()).iterdir(), key=os.path.getmtime)
+
+            for x in paths:
+                x = x.name
                 cfgFilePath = os.path.join(self.get_machine_dir(), x, "cfg")
                 if os.path.exists(cfgFilePath):
                     item_cfg =""
@@ -59,7 +73,9 @@ initrd http://{WEBSESSION}/initramfs-linux.img
 :menu
 menu shim transparent loader demo
 """
+        default_menu = pxe_items[0][0]
         for inst,name,cont in pxe_items:
+            default_menu = inst
             inst+="_name"
             cfg += f"item {inst} {name}\n"
             cfg_boot += "\n"
@@ -71,8 +87,9 @@ boot
         cfg +="""
 item shell         iPXE internal shell
 item exit          Exit
-choose option && goto ${option}
-"""
+choose --default %s --timeout 3000 option && goto ${option}
+
+""" % default_menu
 
         cfg += cfg_boot
         cfg +=""":shell
@@ -105,13 +122,11 @@ exit
     async def handle_post(self, request):
         from datetime import datetime
         now = datetime.now()
-        cfg_name = now.strftime("%m%d%Y_%H%M")
+        cfg_name = now.strftime("%Y%m%d_%H%M")
 
         machine_path = os.path.join(self.get_machine_dir(), f"{cfg_name}")
         machine_path_tmp = machine_path+"_tmp"
         os.makedirs(machine_path_tmp)
-
-
 
         reader = await request.multipart()
         while True:
